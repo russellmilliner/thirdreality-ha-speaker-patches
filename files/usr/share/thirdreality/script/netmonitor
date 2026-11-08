@@ -1,0 +1,332 @@
+#!/bin/sh
+
+DEVICE_CONF="/data/conf/device.json"
+DEVICE_CONF_TMP="/tmp/device_info.netmonitor.tmp.json"
+DEVICE_CONF_LOCK="/tmp/device_info.lock"
+LAST_REBOOT_FILE="/data/conf/.last_wifi_reboot"
+
+INTERVAL_CONNECTED=60
+INTERVAL_DISCONNECTED=30
+INTERVAL_SSID=3
+
+WIFI_FAIL_THRESHOLD=2
+INTERNET_FAIL_THRESHOLD=3
+
+CONNECTIVITY_CHECK_URL1="http://connectivitycheck.gstatic.com/generate_204"
+CONNECTIVITY_CHECK_URL2="http://captive.apple.com/hotspot-detect.html"
+
+get_valid_ipv4_address()
+{
+    ip -o -4 addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1
+}
+
+get_default_gateway()
+{
+    ip route show default dev wlan0 2>/dev/null | awk '/default/ {print $3; exit}'
+}
+
+has_default_route()
+{
+    ip route show default 2>/dev/null | grep -q "dev wlan0"
+}
+
+get_saved_net_state()
+{
+    local saved_state
+
+    saved_state="$(jq -r '.network.status // "disconnected"' "$DEVICE_CONF" 2>/dev/null)"
+
+    case "$saved_state" in
+        connected|connected_no_internet|disconnected)
+            echo "$saved_state"
+            ;;
+        *)
+            echo "disconnected"
+            ;;
+    esac
+}
+
+set_state_artifacts()
+{
+    local state="$1"
+
+    if [ "$state" = "connected" ]; then
+        rm -f /tmp/net_disconnected
+    else
+        touch /tmp/net_disconnected
+    fi
+}
+
+linkReadyCheck()
+{
+    [ -n "$(get_valid_ipv4_address)" ] && has_default_route
+}
+
+ensure_dns_config()
+{
+    local dns_server="8.8.8.8"
+    
+    if [ ! -f /etc/resolv.conf ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Warning: /etc/resolv.conf not found, creating..."
+        echo "nameserver $dns_server" > /etc/resolv.conf
+        return 0
+    fi
+    
+    if ! grep -q "^nameserver" /etc/resolv.conf; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] No nameserver present, adding fallback $dns_server to /etc/resolv.conf"
+        echo "nameserver $dns_server" >> /etc/resolv.conf
+    fi
+}
+
+update_net_state()
+{
+    local new_state="$1"
+    
+    if [ ! -f "$DEVICE_CONF" ]; then
+        echo "Warning: Device config file not found: $DEVICE_CONF"
+        return 1
+    fi
+    
+    (
+        flock -x 9
+        if jq ".network.status = \"$new_state\"" "$DEVICE_CONF" > "$DEVICE_CONF_TMP"; then
+            mv "$DEVICE_CONF_TMP" "$DEVICE_CONF"
+            sync
+        else
+            echo "Error: Failed to update device config"
+            rm -f "$DEVICE_CONF_TMP"
+            return 1
+        fi
+    ) 9>"$DEVICE_CONF_LOCK"
+}
+
+netUpAction()
+{
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network connected"
+    iw dev wlan0 set power_save off 2>/dev/null || true
+    rm -f /tmp/net_disconnected
+    update_net_state "connected"
+}
+
+netDownAction()
+{
+    local new_state
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network disconnected"
+    touch /tmp/net_disconnected
+    
+    if ssidCheck; then
+        new_state="connected_no_internet"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi connected but no internet"
+    else
+        new_state="disconnected"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi disconnected"
+    fi
+    
+    update_net_state "$new_state"
+
+    ensure_dns_config
+    return 0
+}
+
+ssidCheck()
+{
+    # Explicitly require wlan0 to exist and report "Connected to <BSSID>".
+    # Never use `! grep -q "Not connected"` because missing/down wlan0 produces
+    # empty stdout, which falsely returned 0 (connected) in stock firmware.
+    [ -d /sys/class/net/wlan0 ] && iw dev wlan0 link 2>/dev/null | grep -q "^Connected to "
+}
+
+maybe_rate_limited_reboot()
+{
+    local now last diff
+    now="$(date +%s 2>/dev/null || echo 0)"
+    last=0
+    if [ -f "$LAST_REBOOT_FILE" ]; then
+        last="$(cat "$LAST_REBOOT_FILE" 2>/dev/null || echo 0)"
+    fi
+    diff=$((now - last))
+    if [ "$now" -lt 1000000 ] || [ "$diff" -ge 1800 ] || [ "$diff" -lt 0 ]; then
+        echo "$now" > "$LAST_REBOOT_FILE"
+        sync
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Rebooting speaker to recover wedged SDIO/WiFi hardware..."
+        /sbin/reboot
+    fi
+}
+
+reset_wifi_stack()
+{
+    local wait_cnt=0
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resetting wlan0 (dhd_stop/dhd_open) and wpa_supplicant without unloading dhd.ko..."
+    /etc/init.d/S39wifi restart >/dev/null 2>&1 || true
+    if [ ! -d /sys/class/net/wlan0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] wlan0 interface missing after S39wifi restart; triggering rate-limited hardware reboot"
+        maybe_rate_limited_reboot
+        return 1
+    fi
+    while [ $wait_cnt -lt 10 ]; do
+        if ssidCheck; then
+            break
+        fi
+        sleep 1
+        wait_cnt=$((wait_cnt + 1))
+    done
+    iw dev wlan0 set power_save off 2>/dev/null || true
+    /etc/init.d/S41dhcpcd restart >/dev/null 2>&1 || true
+}
+
+gatewayCheck()
+{
+    local gw
+    gw="$(get_default_gateway)"
+    [ -n "$gw" ] && ping -c 1 -W 2 "$gw" >/dev/null 2>&1
+}
+
+connectivityCheck()
+{
+    if ! linkReadyCheck; then
+        return 1
+    fi
+
+    if curl -fsSL --connect-timeout 2 --max-time 3 -o /dev/null "$CONNECTIVITY_CHECK_URL1" 2>/dev/null; then
+        return 0
+    fi
+    
+    if curl -fsSL --connect-timeout 2 --max-time 3 -o /dev/null "$CONNECTIVITY_CHECK_URL2" 2>/dev/null; then
+        return 0
+    fi
+
+    if gatewayCheck; then
+        return 0
+    fi
+    
+    return 1
+}
+
+netCheckState()
+{
+    local current_state
+    local check_interval="$INTERVAL_SSID"
+    local wifi_connected=false
+    local internet_connected=false
+    local wifi_fail_count=0
+    local wifi_reset_count=0
+    local dhcp_fail_count=0
+    local internet_fail_count=0
+    
+    current_state="$(get_saved_net_state)"
+
+    if ssidCheck && linkReadyCheck && [ "$current_state" = "disconnected" ]; then
+        current_state="connected"
+        update_net_state "$current_state"
+    fi
+
+    set_state_artifacts "$current_state"
+    iw dev wlan0 set power_save off 2>/dev/null || true
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network monitor started (self-healing v2 enabled)"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Initial state: $current_state"
+
+    while true
+    do
+        if ssidCheck; then
+            wifi_connected=true
+            wifi_fail_count=0
+            wifi_reset_count=0
+            iw dev wlan0 set power_save off 2>/dev/null || true
+        else
+            wifi_fail_count=$((wifi_fail_count + 1))
+            if [ $wifi_fail_count -ge $WIFI_FAIL_THRESHOLD ]; then
+                wifi_connected=false
+            fi
+        fi
+
+        if [ "$wifi_connected" = false ]; then
+            if [ "$current_state" != "disconnected" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi failed $wifi_fail_count times, marking as disconnected"
+                netDownAction
+                current_state="disconnected"
+            fi
+
+            # Self-healing escalation for disconnected WiFi / wedged Broadcom dhd driver.
+            # Note: A single failed 4-way handshake + wpa_supplicant scan cycle can take ~42.5s,
+            # so use wpa_cli scan + reassociate at 15s, 30s, and 45s, and only reset wlan0 at 60s.
+            if [ $wifi_fail_count -eq 5 ] || [ $wifi_fail_count -eq 10 ] || [ $wifi_fail_count -eq 15 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Self-heal: running wpa_cli scan + reassociate (wifi_fail_count=$wifi_fail_count)"
+                wpa_cli -i wlan0 scan >/dev/null 2>&1 || true
+                sleep 2
+                wpa_cli -i wlan0 reassociate >/dev/null 2>&1 || true
+                iw dev wlan0 set power_save off 2>/dev/null || true
+            elif [ $wifi_fail_count -ge 20 ]; then
+                wifi_reset_count=$((wifi_reset_count + 1))
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Self-heal: WiFi down for 60s (reset #$wifi_reset_count), resetting wlan0 and wpa_supplicant"
+                reset_wifi_stack
+                wifi_fail_count=0
+                if [ $wifi_reset_count -ge 3 ] && ! ssidCheck; then
+                    maybe_rate_limited_reboot
+                fi
+            fi
+
+            dhcp_fail_count=0
+            internet_fail_count=0
+            check_interval="$INTERVAL_SSID"
+            sleep "$check_interval"
+            continue
+        fi
+
+        # WiFi is associated; verify IPv4 address and default route before internet check
+        if ! linkReadyCheck; then
+            dhcp_fail_count=$((dhcp_fail_count + 1))
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi associated but missing IPv4/default route ($dhcp_fail_count/4)"
+            if [ $dhcp_fail_count -ge 4 ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Self-heal: restarting udhcpc to recover IPv4 lease"
+                if [ -x /usr/sbin/avahi-autoipd ]; then
+                    /usr/sbin/avahi-autoipd -k wlan0 2>/dev/null || true
+                fi
+                /etc/init.d/S41dhcpcd restart >/dev/null 2>&1 || true
+                dhcp_fail_count=0
+            fi
+            sleep "$INTERVAL_SSID"
+            continue
+        fi
+        dhcp_fail_count=0
+        
+        if connectivityCheck; then
+            internet_connected=true
+            internet_fail_count=0
+        else
+            internet_fail_count=$((internet_fail_count + 1))
+            
+            if [ $internet_fail_count -ge $INTERNET_FAIL_THRESHOLD ]; then
+                internet_connected=false
+            fi
+        fi
+        
+        if [ "$internet_connected" = true ]; then
+            if [ "$current_state" != "connected" ]; then
+                netUpAction
+                current_state="connected"
+            fi
+            check_interval="$INTERVAL_CONNECTED"
+        else
+            if [ "$current_state" = "connected" ]; then
+                if [ $internet_fail_count -ge $INTERNET_FAIL_THRESHOLD ]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Internet failed $internet_fail_count times, marking as no internet"
+                    netDownAction
+                    current_state="connected_no_internet"
+                else
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Internet check failed ($internet_fail_count/$INTERNET_FAIL_THRESHOLD)"
+                fi
+            elif [ "$current_state" = "disconnected" ] && [ $internet_fail_count -ge $INTERNET_FAIL_THRESHOLD ]; then
+                update_net_state "connected_no_internet"
+                current_state="connected_no_internet"
+            fi
+            check_interval="$INTERVAL_DISCONNECTED"
+        fi
+        
+        sleep "$check_interval"
+    done
+   
+}
+
+netCheckState

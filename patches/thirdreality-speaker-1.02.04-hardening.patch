@@ -1,0 +1,506 @@
+diff -ruN stock-1.02.04/etc/init.d/S30dbus files/etc/init.d/S30dbus
+--- stock-1.02.04/etc/init.d/S30dbus	2026-11-08 17:08:37.625997381 -0500
++++ files/etc/init.d/S30dbus	2026-11-08 17:08:37.723998828 -0500
+@@ -20,7 +20,13 @@
+ start() {
+     printf "Starting system message bus: "
+ 
++    if [ -s /etc/machine-id ] && [ ! -s /tmp/dbus/machine-id ]; then
++        cp /etc/machine-id /tmp/dbus/machine-id
++    fi
+     dbus-uuidgen --ensure
++    if [ -s /tmp/dbus/machine-id ] && [ ! -s /etc/machine-id ]; then
++        cp /tmp/dbus/machine-id /etc/machine-id
++    fi
+     dbus-daemon --system
+     RETVAL=$?
+     echo "done"
+diff -ruN stock-1.02.04/etc/init.d/S39wifi files/etc/init.d/S39wifi
+--- stock-1.02.04/etc/init.d/S39wifi	2026-11-08 17:08:37.853000732 -0500
++++ files/etc/init.d/S39wifi	2026-11-08 17:08:39.465973861 -0500
+@@ -1,48 +1,50 @@
+ #!/bin/sh
+ #
+ # Copyright (c) 2022 Amlogic, Inc. All rights reserved.
+-# This source code is subject to the terms and conditions
+-# defined in the file 'LICENSE' which is part of this source code package.
+-# Description: S39 wifi file
++# Description: S39 wifi file (hardened: avoid unloading dhd.ko / SDIO power-down race on restart)
+ #
+ 
+ MULTI_WIFI=/usr/bin/multi_wifi_load_driver
+ 
+-function start_wpa_suplicant() {
+-    start-stop-daemon -S -m -p /var/run/wpa_supplicant.pid -b -x /usr/sbin/wpa_supplicant -- -Dnl80211 -iwlan0 -c/etc/wpa_supplicant.conf
++start_wpa_suplicant() {
++    start-stop-daemon -S -m -p /var/run/wpa_supplicant.pid -b -x /usr/sbin/wpa_supplicant -- -Dnl80211 -iwlan0 -c/etc/wpa_supplicant.conf >/dev/null 2>&1 </dev/null
+ }
+ 
+-function stop_wpa_suplicant() {
+-    start-stop-daemon -K -o -p /var/run/wpa_supplicant.pid
++stop_wpa_suplicant() {
++    start-stop-daemon -K -o -p /var/run/wpa_supplicant.pid 2>/dev/null || true
++    killall -q wpa_supplicant 2>/dev/null || true
+     rm -rf /var/run/wpa_supplicant.pid
+ }
+ 
+-function stop_network_services()
+-{
+-    /etc/init.d/S80dnsmasq stop
++stop_network_services() {
++    /etc/init.d/S80dnsmasq stop 2>/dev/null || true
+     stop_wpa_suplicant
+-    killall hostapd
++    killall -q hostapd 2>/dev/null || true
+ }
+ 
+-function wifi_start()
+-{
++wifi_start() {
+     stop_network_services
+ 
+     echo "start wifi station mode load driver and setup......"
+-    $MULTI_WIFI station 1
++    if [ ! -d /sys/class/net/wlan0 ]; then
++        $MULTI_WIFI station 1
++        sleep 1
++    fi
+     mkdir -p /data/vendor/wifi
+-    ifconfig wlan0 up > /dev/null
+-    ifconfig wlan0 > /dev/null
+-    ifconfig wlan0 0.0.0.0
++    ifconfig wlan0 up > /dev/null 2>&1
++    ifconfig wlan0 > /dev/null 2>&1
++    if ! ip -o -4 addr show dev wlan0 scope global 2>/dev/null | grep -q "inet "; then
++        ifconfig wlan0 0.0.0.0 2>/dev/null
++    fi
+ 
+-    if [ $? -eq 0 ]; then
++    if [ -d /sys/class/net/wlan0 ]; then
+         echo station > /tmp/wifi_mode
+         start_wpa_suplicant
+-        iw dev wlan0 set power_save off
+-        iw wlan0 interface add wlan1 type managed
+-        # Keep wlan1 down in station mode to avoid STA+STA dual-interface
+-        # radio contention and background scanning, which cause packet loss
+-        # and high latency. wlan1 is only needed when switching to AP mode.
++        iw dev wlan0 set power_save off 2>/dev/null || true
++        if [ ! -d /sys/class/net/wlan1 ]; then
++            iw wlan0 interface add wlan1 type managed 2>/dev/null || true
++        fi
++        ifconfig wlan1 down 2>/dev/null || true
+     fi
+ }
+ 
+@@ -52,12 +54,18 @@
+         ;;
+     stop)
+         stop_network_services
+-        ifconfig wlan1 down
+-        ifconfig wlan0 down
+-        $MULTI_WIFI station 0
++        ifconfig wlan1 down 2>/dev/null || true
++        ifconfig wlan0 down 2>/dev/null || true
++        # Do NOT call "$MULTI_WIFI station 0" on stop/restart:
++        # multi_wifi_load_driver station 1 only waits 10ms after SDIO power-up,
++        # whereas meson-gx-mmc SDIO re-enumeration takes ~240ms, causing
++        # multi_wifi_load_driver to fall through to USB search and call
++        # ioctl(0x6d04) SDIO_POWER_DOWN permanently.
++        # ifconfig wlan0 down -> up already triggers dhd_stop/dhd_open firmware reload.
+         ;;
+     restart)
+         $0 stop
++        sleep 1
+         $0 start
+         ;;
+     *)
+@@ -66,4 +74,3 @@
+ esac
+ 
+ exit $?
+-
+diff -ruN stock-1.02.04/etc/init.d/S41dhcpcd files/etc/init.d/S41dhcpcd
+--- stock-1.02.04/etc/init.d/S41dhcpcd	2026-11-08 17:08:38.174005472 -0500
++++ files/etc/init.d/S41dhcpcd	2026-11-08 17:08:38.328007746 -0500
+@@ -5,12 +5,13 @@
+ 
+ case "$1" in
+   start)
+-        echo "Starting udhcpc..." 
+-        kill -9 $(pidof udhcpc) > /dev/null 2&>1
+-        /sbin/udhcpc -i wlan0 -A 1 -T 1 -b
++        echo "Starting udhcpc..."
++        mkdir -p /var/lib/ntp
++        kill -9 $(pidof udhcpc) > /dev/null 2>&1
++        /sbin/udhcpc -i wlan0 -A 5 -T 3 -t 5 -b
+         ;;
+   stop)
+-        kill -9 $(pidof udhcpc)
++        kill -9 $(pidof udhcpc) > /dev/null 2>&1
+         ;;
+   reload|force-reload)
+         ;;
+diff -ruN stock-1.02.04/etc/init.d/S99ha-speaker files/etc/init.d/S99ha-speaker
+--- stock-1.02.04/etc/init.d/S99ha-speaker	2026-11-08 17:08:38.424009163 -0500
++++ files/etc/init.d/S99ha-speaker	2026-11-08 17:08:38.587011569 -0500
+@@ -20,6 +20,12 @@
+ VOICE_PIDFILE=$PIDDIR/voice-assistant.pid
+ DEVICE_CONF="/data/conf/device.json"
+ 
++export XDG_CONFIG_HOME=/var
++export XDG_RUNTIME_DIR=/run
++[ -f /tmp/dbus/dbus-addr ] && export $(cat /tmp/dbus/dbus-addr)
++[ -f /tmp/dbus/dbus-pid ] && export $(cat /tmp/dbus/dbus-pid)
++trap '' HUP
++
+ CHECK_INTERVAL=10
+ 
+ # Disable flag files: when present, the monitor loop skips restarting that service.
+@@ -37,6 +43,10 @@
+     [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+ }
+ 
++is_voice_port_listening() {
++    netstat -tlne 2>/dev/null | grep -q ":6053 "
++}
++
+ # ---------------------------------------------------------------------------
+ # netmonitor
+ # ---------------------------------------------------------------------------
+@@ -44,7 +54,7 @@
+ start_netmonitor() {
+     is_running "$NETMONITOR_PIDFILE" && return 0
+     rm -f "$NETMONITOR_PIDFILE" "$DISABLE_NETMONITOR"
+-    /usr/share/thirdreality/script/netmonitor &
++    nohup /usr/share/thirdreality/script/netmonitor >/dev/null 2>&1 </dev/null &
+     echo $! > "$NETMONITOR_PIDFILE"
+ }
+ 
+@@ -70,9 +80,9 @@
+ 
+     local spk_name
+     spk_name=$(jq -r '.device.name // "thirdreality-speaker"' "$DEVICE_CONF")
+-    /usr/bin/linux-voice-assistant-cpp \
++    nohup /usr/bin/linux-voice-assistant-cpp \
+         --name "$spk_name" \
+-        --port 6053 &
++        --port 6053 >/dev/null 2>&1 </dev/null &
+     echo $! > "$VOICE_PIDFILE"
+ }
+ 
+@@ -91,6 +101,7 @@
+ # ---------------------------------------------------------------------------
+ 
+ monitor_loop() {
++    local voice_port_fail_count=0
+     while true; do
+         # 1. netmonitor
+         if [ ! -f "$DISABLE_NETMONITOR" ] && ! is_running "$NETMONITOR_PIDFILE"; then
+@@ -98,10 +109,32 @@
+             start_netmonitor
+         fi
+ 
++        # Guard against boot race with ntpdate.sh: if ntpd is already running,
++        # ntpdate.sh has finished, so clear any stale boot DISABLE_VOICE lock.
++        if [ -f "$DISABLE_VOICE" ] && [ ! -f /tmp/ha_manual_stop_voice ] && pidof ntpd > /dev/null 2>&1; then
++            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ntpd active; clearing boot DISABLE_VOICE lock..."
++            rm -f "$DISABLE_VOICE"
++        fi
++
+         # 2. voice-assistant
+-        if [ ! -f "$DISABLE_VOICE" ] && ! is_running "$VOICE_PIDFILE"; then
+-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] voice-assistant not running, restarting..."
+-            start_voice_assistant
++        if [ ! -f "$DISABLE_VOICE" ]; then
++            if ! is_running "$VOICE_PIDFILE"; then
++                echo "[$(date '+%Y-%m-%d %H:%M:%S')] voice-assistant not running, restarting..."
++                voice_port_fail_count=0
++                start_voice_assistant
++            elif is_voice_port_listening; then
++                voice_port_fail_count=0
++            else
++                voice_port_fail_count=$((voice_port_fail_count + 1))
++                if [ $voice_port_fail_count -ge 3 ]; then
++                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] voice-assistant port 6053 not listening for 30s, restarting..."
++                    stop_voice_assistant
++                    rm -f "$DISABLE_VOICE"
++                    sleep 1
++                    start_voice_assistant
++                    voice_port_fail_count=0
++                fi
++            fi
+         fi
+ 
+         # 3. pulseaudio
+@@ -121,13 +154,26 @@
+ # ---------------------------------------------------------------------------
+ 
+ start() {
+-    mkdir -p "$PIDDIR"
++    mkdir -p "$PIDDIR" /var/lib/ntp
+ 
+     if is_running "$MONITOR_PIDFILE"; then
+         echo "ha-speaker already running (PID: $(cat "$MONITOR_PIDFILE"))"
+         exit 0
+     fi
+ 
++    # Persist machine-id and prune orphaned PulseAudio files from prior boots
++    if [ -s /var/lib/dbus/machine-id ]; then
++        MID="$(cat /var/lib/dbus/machine-id)"
++        [ ! -s /etc/machine-id ] && cp /var/lib/dbus/machine-id /etc/machine-id
++        for f in /var/pulse/*; do
++            [ -e "$f" ] || continue
++            case "$f" in
++                *"$MID"*|*/cookie) ;;
++                *) rm -f "$f" /data/overlay/upper"$f" 2>/dev/null || true ;;
++            esac
++        done
++    fi
++
+     /usr/share/thirdreality/script/setup_env.sh
+ 
+     NETWORK_STATUS=$(jq -r '.network.status // "disconnected"' "$DEVICE_CONF" 2>/dev/null)
+@@ -136,13 +182,19 @@
+         paplay /usr/share/thirdreality/audio/setup_mode.wav &
+     fi
+ 
+-    # voice-assistant requires network (NTP sync). Disable it at boot;
+-    # ntpdate.sh enables it after the first sync.
+-    touch "$DISABLE_VOICE"
++    rm -f /tmp/ha_manual_stop_voice
++    # voice-assistant requires network (NTP sync). Disable it at boot only if
++    # ntpdate.sh hasn't already completed and started ntpd.
++    if ! pidof ntpd > /dev/null 2>&1 && ! is_running "$VOICE_PIDFILE"; then
++        touch "$DISABLE_VOICE"
++    else
++        rm -f "$DISABLE_VOICE"
++    fi
+ 
+     start_netmonitor
+ 
+-    monitor_loop &
++    trap '' HUP
++    monitor_loop >/dev/null 2>&1 </dev/null &
+     echo $! > "$MONITOR_PIDFILE"
+     echo "ha-speaker started (PID: $(cat "$MONITOR_PIDFILE"))"
+ }
+@@ -160,7 +212,7 @@
+     stop_voice_assistant
+     stop_netmonitor
+     # Clear disable flags so next start brings everything up
+-    rm -f "$DISABLE_NETMONITOR" "$DISABLE_VOICE"
++    rm -f "$DISABLE_NETMONITOR" "$DISABLE_VOICE" /tmp/ha_manual_stop_voice
+ }
+ 
+ restart() {
+@@ -187,9 +239,9 @@
+             ;;
+         voice-assistant)
+             case "$action" in
+-                start)   start_voice_assistant ;;
+-                stop)    stop_voice_assistant ;;
+-                restart) stop_voice_assistant; sleep 1; start_voice_assistant ;;
++                start)   rm -f /tmp/ha_manual_stop_voice; start_voice_assistant ;;
++                stop)    touch /tmp/ha_manual_stop_voice; stop_voice_assistant ;;
++                restart) rm -f /tmp/ha_manual_stop_voice; stop_voice_assistant; sleep 1; start_voice_assistant ;;
+                 *) echo "Usage: $0 voice-assistant {start|stop|restart}"; exit 1 ;;
+             esac
+             ;;
+diff -ruN stock-1.02.04/usr/share/thirdreality/script/netmonitor files/usr/share/thirdreality/script/netmonitor
+--- stock-1.02.04/usr/share/thirdreality/script/netmonitor	2026-11-08 17:08:38.810014861 -0500
++++ files/usr/share/thirdreality/script/netmonitor	2026-11-08 17:08:39.466695759 -0500
+@@ -3,6 +3,7 @@
+ DEVICE_CONF="/data/conf/device.json"
+ DEVICE_CONF_TMP="/tmp/device_info.netmonitor.tmp.json"
+ DEVICE_CONF_LOCK="/tmp/device_info.lock"
++LAST_REBOOT_FILE="/data/conf/.last_wifi_reboot"
+ 
+ INTERVAL_CONNECTED=60
+ INTERVAL_DISCONNECTED=30
+@@ -19,6 +20,11 @@
+     ip -o -4 addr show dev wlan0 scope global 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1
+ }
+ 
++get_default_gateway()
++{
++    ip route show default dev wlan0 2>/dev/null | awk '/default/ {print $3; exit}'
++}
++
+ has_default_route()
+ {
+     ip route show default 2>/dev/null | grep -q "dev wlan0"
+@@ -69,8 +75,6 @@
+     if ! grep -q "^nameserver" /etc/resolv.conf; then
+         echo "[$(date '+%Y-%m-%d %H:%M:%S')] No nameserver present, adding fallback $dns_server to /etc/resolv.conf"
+         echo "nameserver $dns_server" >> /etc/resolv.conf
+-    else
+-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] DNS config OK (nameserver already present)"
+     fi
+ }
+ 
+@@ -99,6 +103,7 @@
+ netUpAction()
+ {
+     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network connected"
++    iw dev wlan0 set power_save off 2>/dev/null || true
+     rm -f /tmp/net_disconnected
+     update_net_state "connected"
+ }
+@@ -126,11 +131,55 @@
+ 
+ ssidCheck()
+ {
+-    if iw dev wlan0 link 2>/dev/null | grep -q "Not connected"; then
++    # Explicitly require wlan0 to exist and report "Connected to <BSSID>".
++    # Never use `! grep -q "Not connected"` because missing/down wlan0 produces
++    # empty stdout, which falsely returned 0 (connected) in stock firmware.
++    [ -d /sys/class/net/wlan0 ] && iw dev wlan0 link 2>/dev/null | grep -q "^Connected to "
++}
++
++maybe_rate_limited_reboot()
++{
++    local now last diff
++    now="$(date +%s 2>/dev/null || echo 0)"
++    last=0
++    if [ -f "$LAST_REBOOT_FILE" ]; then
++        last="$(cat "$LAST_REBOOT_FILE" 2>/dev/null || echo 0)"
++    fi
++    diff=$((now - last))
++    if [ "$now" -lt 1000000 ] || [ "$diff" -ge 1800 ] || [ "$diff" -lt 0 ]; then
++        echo "$now" > "$LAST_REBOOT_FILE"
++        sync
++        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Rebooting speaker to recover wedged SDIO/WiFi hardware..."
++        /sbin/reboot
++    fi
++}
++
++reset_wifi_stack()
++{
++    local wait_cnt=0
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resetting wlan0 (dhd_stop/dhd_open) and wpa_supplicant without unloading dhd.ko..."
++    /etc/init.d/S39wifi restart >/dev/null 2>&1 || true
++    if [ ! -d /sys/class/net/wlan0 ]; then
++        echo "[$(date '+%Y-%m-%d %H:%M:%S')] wlan0 interface missing after S39wifi restart; triggering rate-limited hardware reboot"
++        maybe_rate_limited_reboot
+         return 1
+-    else
+-        return 0
+     fi
++    while [ $wait_cnt -lt 10 ]; do
++        if ssidCheck; then
++            break
++        fi
++        sleep 1
++        wait_cnt=$((wait_cnt + 1))
++    done
++    iw dev wlan0 set power_save off 2>/dev/null || true
++    /etc/init.d/S41dhcpcd restart >/dev/null 2>&1 || true
++}
++
++gatewayCheck()
++{
++    local gw
++    gw="$(get_default_gateway)"
++    [ -n "$gw" ] && ping -c 1 -W 2 "$gw" >/dev/null 2>&1
+ }
+ 
+ connectivityCheck()
+@@ -139,8 +188,6 @@
+         return 1
+     fi
+ 
+-    # Use GET instead of HEAD. Some networks/proxies do not handle HEAD well,
+-    # which causes false negatives even though general internet access works.
+     if curl -fsSL --connect-timeout 2 --max-time 3 -o /dev/null "$CONNECTIVITY_CHECK_URL1" 2>/dev/null; then
+         return 0
+     fi
+@@ -148,6 +195,10 @@
+     if curl -fsSL --connect-timeout 2 --max-time 3 -o /dev/null "$CONNECTIVITY_CHECK_URL2" 2>/dev/null; then
+         return 0
+     fi
++
++    if gatewayCheck; then
++        return 0
++    fi
+     
+     return 1
+ }
+@@ -159,6 +210,8 @@
+     local wifi_connected=false
+     local internet_connected=false
+     local wifi_fail_count=0
++    local wifi_reset_count=0
++    local dhcp_fail_count=0
+     local internet_fail_count=0
+     
+     current_state="$(get_saved_net_state)"
+@@ -169,8 +222,9 @@
+     fi
+ 
+     set_state_artifacts "$current_state"
++    iw dev wlan0 set power_save off 2>/dev/null || true
+ 
+-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network monitor started"
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Network monitor started (self-healing v2 enabled)"
+     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Initial state: $current_state"
+ 
+     while true
+@@ -178,6 +232,8 @@
+         if ssidCheck; then
+             wifi_connected=true
+             wifi_fail_count=0
++            wifi_reset_count=0
++            iw dev wlan0 set power_save off 2>/dev/null || true
+         else
+             wifi_fail_count=$((wifi_fail_count + 1))
+             if [ $wifi_fail_count -ge $WIFI_FAIL_THRESHOLD ]; then
+@@ -191,11 +247,49 @@
+                 netDownAction
+                 current_state="disconnected"
+             fi
++
++            # Self-healing escalation for disconnected WiFi / wedged Broadcom dhd driver.
++            # Note: A single failed 4-way handshake + wpa_supplicant scan cycle can take ~42.5s,
++            # so use wpa_cli scan + reassociate at 15s, 30s, and 45s, and only reset wlan0 at 60s.
++            if [ $wifi_fail_count -eq 5 ] || [ $wifi_fail_count -eq 10 ] || [ $wifi_fail_count -eq 15 ]; then
++                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Self-heal: running wpa_cli scan + reassociate (wifi_fail_count=$wifi_fail_count)"
++                wpa_cli -i wlan0 scan >/dev/null 2>&1 || true
++                sleep 2
++                wpa_cli -i wlan0 reassociate >/dev/null 2>&1 || true
++                iw dev wlan0 set power_save off 2>/dev/null || true
++            elif [ $wifi_fail_count -ge 20 ]; then
++                wifi_reset_count=$((wifi_reset_count + 1))
++                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Self-heal: WiFi down for 60s (reset #$wifi_reset_count), resetting wlan0 and wpa_supplicant"
++                reset_wifi_stack
++                wifi_fail_count=0
++                if [ $wifi_reset_count -ge 3 ] && ! ssidCheck; then
++                    maybe_rate_limited_reboot
++                fi
++            fi
++
++            dhcp_fail_count=0
+             internet_fail_count=0
+             check_interval="$INTERVAL_SSID"
+             sleep "$check_interval"
+             continue
+         fi
++
++        # WiFi is associated; verify IPv4 address and default route before internet check
++        if ! linkReadyCheck; then
++            dhcp_fail_count=$((dhcp_fail_count + 1))
++            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WiFi associated but missing IPv4/default route ($dhcp_fail_count/4)"
++            if [ $dhcp_fail_count -ge 4 ]; then
++                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Self-heal: restarting udhcpc to recover IPv4 lease"
++                if [ -x /usr/sbin/avahi-autoipd ]; then
++                    /usr/sbin/avahi-autoipd -k wlan0 2>/dev/null || true
++                fi
++                /etc/init.d/S41dhcpcd restart >/dev/null 2>&1 || true
++                dhcp_fail_count=0
++            fi
++            sleep "$INTERVAL_SSID"
++            continue
++        fi
++        dhcp_fail_count=0
+         
+         if connectivityCheck; then
+             internet_connected=true
